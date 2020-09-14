@@ -10,7 +10,7 @@
 use alloc::vec::Vec;
 
 use super::super::transport::pci::ComCfg;
-use super::{VqSize, VqIndex, MemPool, MemDescrId, MemDescr, BufferToken, TransferToken, Transfer, TransferState, Buffer, BuffSpec, Bytes, AsSliceU8, Pinned, Virtq, DescrFlags};
+use super::{VqSize, VqIndex, MemPool, MemDescrId, MemDescr, BufferToken, TransferToken, Transfer, TransferState, Buffer, BuffSpec, Bytes, AsSliceU8, Pinned, Virtq, DescrFlags, VqMode};
 use super::error::VirtqError;
 use self::error::VqPackedError;
 use core::convert::TryFrom;
@@ -285,7 +285,7 @@ impl PackedVq {
         self.index
     }
 
-    pub fn new(com_cfg: &mut ComCfg, size: VqSize, index: VqIndex) -> Result<Self, VqPackedError> {
+    pub fn new(com_cfg: &mut ComCfg, size: VqSize, index: VqIndex, mode: VqMode) -> Result<Self, VqPackedError> {
         // Get a handler to the queues configuration area.
         let mut vq_handler = match com_cfg.select_vq(index.into()) {
             Some(handler) => handler,
@@ -319,6 +319,12 @@ impl PackedVq {
 
         // Initalize an empty vector for future dropped transfers
         let dropped: Vec<Pinned<TransferToken>> = Vec::new();
+
+        if mode == VqMode::Busy {
+            todo!("Start task here and let it run forever");
+        } else if mode == VqMode::Poll {
+            
+        }
 
         Ok(PackedVq {
             descr_ring,

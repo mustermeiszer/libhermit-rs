@@ -91,11 +91,24 @@ impl From<VqSize> for u16 {
 }
 
 /// Enum that defines which virtqueue shall be created when used via the `Virtq::new()` function.
-pub enum VqType{
+pub enum VqType {
     Packed,
     Split,
 }
 
+/// Enum that allows setting a specific mode, the virtqueue is working under. This mode can not be 
+/// changed after initalization.
+pub enum VqMode {
+    /// Indicates, that the virtqueue must be actively polled by the driver
+    /// in order to process descriptors.
+    Poll,
+    /// Indicates that the virtqueue is permanently processing descriptors. No active polling
+    /// of the actual virtqueue structure is necessary here. 
+    ///
+    /// This mode will create a second thread/task which handles polling the actual ring 
+    /// structure. 
+    Busy,
+}
 /// The Virtq enum unifies access to the two different Virtqueue types 
 /// [PackedVq](structs.PackedVq.html) and [SplitVq](structs.SplitVq.html).
 ///
@@ -151,7 +164,14 @@ impl Virtq {
 impl Virtq {
     /// Dispatches a batch of TransferTokens. The actuall behaviour depends on the respective 
     /// virtqueue implementation. Pleace see the respective docs for details
-    pub fn dispatch_batch(tkns: Vec<TransferToken>) -> Vec<Transfer> {
+    ///
+    /// Return value depends on mode:
+    /// * VqMode::Poll -> Some<Vec<Transfer>>
+    /// * VqMode::Busy -> None,
+    /// * In cases where multiple queues are used and TransferTokens are dispatched coming from multiple queues
+    /// and some of these queues work in poll-mode or in busy-mode, then the function will return `Transfers` for 
+    /// `TransferTokens` coming from queues in poll-mode.
+    pub fn dispatch_batch(tkns: Vec<TransferToken>) -> Option<Vec<Transfer>> {
         todo!("Implement dispatch, best would be with a HashMap(index, Vec<Tkn>)");
     }
 
@@ -164,7 +184,15 @@ impl Virtq {
         todo!("Implement dispatch, best would be with a HashMap(index, Vec<Tkn>)");
     }
 
-    pub fn dispatch(&self, tkn: TransferToken) -> Transfer {
+    /// Dispatches a `TransferToken` to the virtqueue. This function is private as 
+    /// `TransferTokens` shall be transfered as a method on the token itself. But in order to create 
+    /// unified interface for both queues, this function then calls the actual dispatch function of the 
+    /// respective queue. 
+    ///
+    /// Return value depends on mode:
+    /// * VqMode::Poll -> Some<Transfer>
+    /// * VqMode::Busy -> None, 
+    fn dispatch(&self, tkn: TransferToken) -> Option<Transfer> {
         match self {
             Virtq::Packed(vq) => vq.dispatch(tkn),
             Virtq::Split(vq) => unimplemented!(),
@@ -176,9 +204,9 @@ impl Virtq {
     /// Upon creation the virtqueue is "registered" at the device via the `ComCfg` struct.
     ///
     /// Be aware, that devices define a maximum number of queues and a maximal size they can handle.
-    pub fn new(com_cfg: &mut ComCfg, size: VqSize, vq_type: VqType, index: VqIndex) -> Self {
+    pub fn new(com_cfg: &mut ComCfg, size: VqSize, vq_type: VqType, index: VqIndex, mode: VqMode) -> Self {
         match vq_type {
-            VqType::Packed => match PackedVq::new(com_cfg, size, index) {
+            VqType::Packed => match PackedVq::new(com_cfg, size, index, mode) {
                 Ok(packed_vq) => Virtq::Packed(packed_vq),
                 Err(vq_error) => panic!("Currently panics if queue fails to be created")
             },
@@ -621,7 +649,7 @@ impl Transfer {
         match self.transfer_tkn.as_ref().unwrap().state {
             TransferState::Finished => {
                 if self.transfer_tkn.as_ref().unwrap().buff_tkn.as_ref().unwrap().reusable {
-                    Ok(self.transfer_tkn.take().unwrap().into_inner().buff_tkn.take().unwrap())
+                    Ok(unsafe {self.transfer_tkn.take().unwrap().into_inner().buff_tkn.take().unwrap()} )
                 } else {
                     Err(VirtqError::NoReuseBuffer)
                 }
@@ -665,6 +693,8 @@ impl TransferToken {
         Rc::clone(&self.buff_tkn.as_ref().unwrap().vq)
     }
 
+    /// Dispatches the provided TransferToken to the respective queue.
+    /// The finished transfer will be placed inside the provided await_queue.
     pub fn dispatch_await(mut self, await_queue: Rc<RefCell<VecDeque<Transfer>>>) {
         self.await_queue = Some(Rc::clone(&await_queue));
         
@@ -672,23 +702,44 @@ impl TransferToken {
         // I.e. do NOT run the costum constructor which will 
         // deallocate memory, as we never call drop upon
         // the ManuallyDrop<Pinned<TransferToken>>
-        core::mem::ManuallyDrop::new(self.get_vq().dispatch(self).transfer_tkn.take());
+        match self.get_vq().dispatch(self) {
+            Some(transfer) => {
+                // Unwrapping is okay. If a Transfer without a TransferToken exists
+                // panic-ing is valid.
+                transfer.transfer_tkn.take().unwrap().preserve();
+            }
+            None => (), // If virtqueue is in poll mode, there is no need to prevent dropping, as None is returned
+        }
     }
 
-    /// Dispatches the provided TransferToken to the respective queue and returns a transfer.
-    pub fn dispatch(self) -> Transfer {
+    /// Dispatches the provided TransferToken to the respective queue.
+    ///
+    /// Return value depends on mode:
+    /// * VqMode::Poll -> Some<Transfer>
+    /// * VqMode::Busy -> None, 
+    pub fn dispatch(self) -> Option<Transfer> {
         self.get_vq().dispatch(self)
     }
 
     /// Dispatches the provided TransferToken to the respectuve queue and does 
     /// return when, the queue finished the transfer.
     ///
+    /// WARN: ONLY available if `VqMode == Busy`! Returns `Err(VirtqError::General)`
+    /// if queue is in a different mode.
+    ///
     /// The resultaing [TransferState](TransferState) in this case is of course 
     /// finished and the returned [Transfer](Transfer) can be reused, copyied from
     /// or return the underlying buffers.
     /// Allthough it is recomended to ensure the finished state via`Transfer.poll()` beforehand.
     pub fn dispatch_blocking(self) -> Result<Transfer, VirtqError> {
-        let transfer = self.get_vq().dispatch(self);
+        let transfer =  match self.get_vq().dispatch(self) {
+            Some(transfer) => transfer,
+            None => {
+                // Blocking transfers are currently only possible if the queue
+                // works in `VqMode::Busy`.
+                return Err(VirtqError::General);
+            } 
+        };
 
         while transfer.transfer_tkn.as_ref().unwrap().state != TransferState::Finished {
             // Keep Spinning untill the state changes to Finished
@@ -1587,15 +1638,24 @@ impl<T: Sized> Pinned<T> {
             raw_ptr: Box::into_raw(boxed)
         }
     }
+
+    /// Creates a `Pinned<T>` from a raw pointer. 
+    /// The raw pointer MUST either come from:
+    /// * `Pinned<T>.raw_addr()`
+    /// * `Pinned<T>.preserve()`
+    /// * `Box<T>.into_raw()`
+    fn from_raw(ptr: *mut T) -> Pinned<T>{
+        Pinned {
+            raw_ptr: ptr,
+        }
+    }
     
     /// Unpins the pinned value and returns it. This is only
     /// save as long as no one relies on the
     /// memory location of `T`, as this location
     /// will no longer be constant.
     fn into_inner(self) -> T {
-        unsafe {
-            *Box::from_raw(self.raw_ptr)
-        }
+        unsafe {*Box::from_raw(self.raw_ptr)}
     }
 
     /// Returns a pointer to `T`. The pointer
@@ -1603,6 +1663,19 @@ impl<T: Sized> Pinned<T> {
     /// `Pinned<T>`.
     fn raw_addr(&self) -> *mut T {
         self.raw_ptr
+    }
+
+    /// Drop the `Pinned<T>` but do not run its destructure.
+    /// Simply calls ManuallyDrop::new(self).
+    /// I.e.: Prevent that `T` is deallocated, ensure that memory 
+    /// address of `Pinned<T>` remains valid.
+    ///
+    /// After this call the calley is responsible for the handling 
+    /// the memory. 
+    fn preserve(self) -> *mut T {
+        let ptr = self.raw_ptr;
+        core::mem::ManuallyDrop::new(self);
+        ptr
     }
 }
 
