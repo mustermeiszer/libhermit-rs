@@ -847,7 +847,7 @@ impl VirtioNetDriver {
         // If wanted, push new features into feats here:
         //
         // Indirect descriptors can be used
-        // feats.push(Features::VIRTIO_F_RING_INDIRECT_DESC);
+        feats.push(Features::VIRTIO_F_RING_INDIRECT_DESC);
         // MTU setting is possible
         feats.push(Features::VIRTIO_NET_F_MTU);
 
