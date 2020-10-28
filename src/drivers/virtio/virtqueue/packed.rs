@@ -22,6 +22,9 @@ use core::sync::atomic::{fence, Ordering};
 use alloc::rc::Rc;
 use core::ops::Deref;
 use alloc::collections::VecDeque;
+use crate::synch::spinlock::SpinlockIrqSave;
+use crate::scheduler::PerCoreScheduler;
+use crate::scheduler;
 
 /// A newtype of bool used for convenience in context with 
 /// packed queues wrap counter.
@@ -108,16 +111,6 @@ struct DescriptorRing {
 impl DescriptorRing {
     fn new(size: u16) -> Self {
         let size = usize::try_from(size).unwrap();
-        // WARN: Uncatched as usize call here. Could panic if used with usize < u16
-        /*let mut ring = Box::new(Vec::with_capacity(size));
-        for _ in 0..size {
-            ring.push(Descriptor {
-                address: 0,
-                len: 0,
-                buff_id: 0,
-                flags: 0,
-            });
-        }*/
         // Allocate heap memory via a vec, leak and cast
         let _mem_len = align_up!(size * core::mem::size_of::<Descriptor>(), BasePageSize::SIZE);
         let ptr = (crate::mm::allocate(_mem_len, true).0 as *const Descriptor) as *mut Descriptor;
@@ -141,6 +134,30 @@ impl DescriptorRing {
             drv_wc: WrapCount::new(),
             dev_wc: WrapCount::new(),
          }
+    }
+
+    extern "C" fn static_poll(ring: usize){
+        let ring = unsafe{
+            Box::from_raw((ring as *const SpinlockIrqSave<DescriptorRing>) as *mut SpinlockIrqSave<DescriptorRing>)
+        };
+
+        let mut cnt: u16 = 0;
+        loop{
+            if cnt % 10000 == 0 {
+                info!("Polling ring static.");
+                let mut guard = ring.lock();
+                guard.poll();
+                drop(guard)
+            }
+            cnt = cnt.wrapping_add(1);
+         
+            if cnt == 30001 {
+                break;
+            }
+            scheduler::task::break;
+        }
+
+        Box::into_raw(ring);
     }
 
     /// Polls poll index and sets states of eventually used TransferTokens to finished.
@@ -978,7 +995,7 @@ impl DevNotif {
 pub struct PackedVq {
     /// Ring which allows easy access to the raw ring structure of the 
     /// specfification
-    descr_ring: RefCell<DescriptorRing>,
+    descr_ring: Box<SpinlockIrqSave<DescriptorRing>>,
     /// Allows to tell the device if notifications are wanted
     drv_event: RefCell<DrvNotif>,
     /// Allows to check, if the device wants a notification
@@ -998,6 +1015,8 @@ pub struct PackedVq {
     /// If `TransferToken.state == TransferState::Finished`
     /// the Token can be safely dropped
     dropped: RefCell<Vec<Pinned<TransferToken>>>,
+    /// Thread id of a possible polling thread. This enables switching between busy and polling mode
+    poll_thread_id: Option<scheduler::task::TaskId>,
 }
 
 
@@ -1028,7 +1047,7 @@ impl PackedVq {
 
     /// See `Virtq.poll()` documentation
     pub fn poll(&self) {
-        self.descr_ring.borrow_mut().poll();
+        self.descr_ring.lock().poll();
     }
 
     /// Dispatches a batch of transfer token. The buffers of the respective transfers are provided to the queue in 
@@ -1042,7 +1061,7 @@ impl PackedVq {
         // Zero transfers are not allowed
         assert!(tkns.len() > 0);
 
-        let (pin_tkn_lst, next_off, next_wrap) = self.descr_ring.borrow_mut().push_batch(tkns);
+        let (pin_tkn_lst, next_off, next_wrap) = self.descr_ring.lock().push_batch(tkns);
         
         if notif {
             self.drv_event.borrow_mut().enable_specific(next_off as u16, next_wrap);
@@ -1100,7 +1119,7 @@ impl PackedVq {
             tkn.await_queue = Some(Rc::clone(&await_queue));
         }
 
-        let (pin_tkn_lst, next_off, next_wrap) = self.descr_ring.borrow_mut().push_batch(tkns);
+        let (pin_tkn_lst, next_off, next_wrap) = self.descr_ring.lock().push_batch(tkns);
 
         if notif {
             self.drv_event.borrow_mut().enable_specific(next_off as u16, next_wrap);
@@ -1141,7 +1160,7 @@ impl PackedVq {
     /// transfer. This is only for performance optimization. As it is NOT ensured, that the device sees the 
     /// updated notification flags before finishing transfers!
     pub fn dispatch(&self, tkn: TransferToken, notif: bool) -> Transfer {
-        let (pin_tkn, next_off, next_wrap) = self.descr_ring.borrow_mut().push(tkn);
+        let (pin_tkn, next_off, next_wrap) = self.descr_ring.lock().push(tkn);
 
         if notif {
             self.drv_event.borrow_mut().enable_specific(next_off as u16, next_wrap);
@@ -1227,10 +1246,8 @@ impl PackedVq {
         } else {
             vq_handler.set_vq_size(size.0)
         };
-        
-        let descr_ring = RefCell::new(DescriptorRing::new(vq_size));
-        /*let drv_event = Box::into_raw(Box::new(EventSuppr::new()));
-        let dev_event= Box::into_raw(Box::new(EventSuppr::new()));*/
+    
+        let descr_ring = Box::new(SpinlockIrqSave::new(DescriptorRing::new(vq_size)));
 
         // Allocate heap memory via a vec, leak and cast
         let _mem_len = align_up!(core::mem::size_of::<EventSuppr>(), BasePageSize::SIZE);
@@ -1239,7 +1256,7 @@ impl PackedVq {
         let dev_event_ptr = (crate::mm::allocate(_mem_len, true).0 as *const EventSuppr) as *mut EventSuppr;
 
         // Provide memory areas of the queues data structures to the device
-        vq_handler.set_ring_addr(paging::virt_to_phys(VirtAddr::from(descr_ring.borrow().raw_addr() as u64)));
+        vq_handler.set_ring_addr(paging::virt_to_phys(VirtAddr::from(descr_ring.lock().raw_addr() as u64)));
         // As usize is safe here, as the *mut EventSuppr raw pointer is a thin pointer of size usize
         vq_handler.set_drv_ctrl_addr(paging::virt_to_phys(VirtAddr::from(drv_event_ptr as u64)));
         vq_handler.set_dev_ctrl_addr(paging::virt_to_phys(VirtAddr::from(dev_event_ptr as u64)));
@@ -1282,6 +1299,16 @@ impl PackedVq {
         let dropped: RefCell<Vec<Pinned<TransferToken>>> = RefCell::new(Vec::new());
 
         vq_handler.enable_queue();
+
+        let raw_ring = Box::into_raw(descr_ring);
+
+        let poll_thread_id = if true {
+            Some(PerCoreScheduler::spawn(DescriptorRing::static_poll, raw_ring as usize, scheduler::task::NORMAL_PRIO, 0, crate::config::USER_STACK_SIZE))
+        } else {
+            None
+        };
+        
+        let descr_ring = unsafe {Box::from_raw(raw_ring)};
         
         info!("Created PackedVq: idx={}, size={}", index.0, vq_size);
 
@@ -1294,6 +1321,7 @@ impl PackedVq {
             size: VqSize::from(vq_size),
             index,
             dropped,
+            poll_thread_id,
         })
     }
 
