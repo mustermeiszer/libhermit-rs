@@ -25,6 +25,7 @@ use alloc::collections::VecDeque;
 use crate::synch::spinlock::SpinlockIrqSave;
 use crate::scheduler::PerCoreScheduler;
 use crate::scheduler;
+use crate::percore;
 
 /// A newtype of bool used for convenience in context with 
 /// packed queues wrap counter.
@@ -136,25 +137,17 @@ impl DescriptorRing {
          }
     }
 
+
     extern "C" fn static_poll(ring: usize){
         let ring = unsafe{
             Box::from_raw((ring as *const SpinlockIrqSave<DescriptorRing>) as *mut SpinlockIrqSave<DescriptorRing>)
         };
 
-        let mut cnt: u16 = 0;
+        let core_scheduler = percore::core_scheduler();
+
         loop{
-            if cnt % 10000 == 0 {
-                info!("Polling ring static.");
-                let mut guard = ring.lock();
-                guard.poll();
-                drop(guard)
-            }
-            cnt = cnt.wrapping_add(1);
-         
-            if cnt == 30001 {
-                break;
-            }
-            scheduler::task::break;
+            ring.lock().poll();
+            core_scheduler.reschedule();
         }
 
         Box::into_raw(ring);
